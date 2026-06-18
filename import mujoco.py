@@ -5,11 +5,13 @@ import time
 import csv
 import math
 import collections
+from pathlib import Path
 
 # ==========================================================
 # CONFIGURATION
 # ==========================================================
 PLAYBACK_SPEED = 1.5  # Multiplier for simulation viewer speed (1.0 = real-time, 2.0 = fast forward)
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # ==========================================================
 # LOAD MODEL
@@ -37,6 +39,14 @@ joint_names = [
     "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee_pitch", "right_ankle_pitch", "right_ankle_roll"
 ]
 
+trajectory_body_names = [
+    "torso",
+    "left_hip_yaw_link", "left_hip_roll_link", "left_thigh_link", "left_shin_link", "left_ankle_pitch_link", "left_foot_link",
+    "right_hip_yaw_link", "right_hip_roll_link", "right_thigh_link", "right_shin_link", "right_ankle_pitch_link", "right_foot_link",
+]
+
+foot_geom_names = ["left_foot", "right_foot"]
+
 def get_body_id(name):
     return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
 
@@ -49,6 +59,27 @@ def get_com_y():
 def get_foot_y(side):
     name = "left_foot_link" if side == 'L' else "right_foot_link"
     return float(data.xpos[get_body_id(name), 1])
+
+def get_foot_surface_point(geom_name):
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+    center = data.geom_xpos[geom_id]
+    rotation = data.geom_xmat[geom_id].reshape(3, 3)
+    half_height = model.geom_size[geom_id, 2]
+    return center + rotation @ np.array([0.0, 0.0, -half_height])
+
+def quat_to_rotation_matrix(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+def world_to_root_frame(point):
+    root_pos = data.qpos[0:3]
+    root_quat = data.qpos[3:7]
+    root_rotation = quat_to_rotation_matrix(root_quat)
+    return root_rotation.T @ (point - root_pos)
 
 # ==========================================================
 # GAIT PARAMETERS
@@ -529,11 +560,33 @@ last_mode_print = ""
 
 # Telemetry
 telemetry_data = collections.defaultdict(list)
-telemetry_headers = ["time", "state", "mode", "torso_x", "torso_y", "torso_z", "imu_roll", "imu_pitch", "imu_yaw"]
+trajectory_rows = []
+telemetry_headers = [
+    "time", "state", "mode", "command", "step_count",
+    "root_x", "root_y", "root_z",
+    "torso_x", "torso_y", "torso_z",
+    "com_x", "com_y", "com_z",
+    "imu_roll", "imu_pitch", "imu_yaw",
+]
+for body_name in trajectory_body_names:
+    telemetry_headers.extend([f"{body_name}_x", f"{body_name}_y", f"{body_name}_z"])
+for geom_name in foot_geom_names:
+    telemetry_headers.extend([
+        f"{geom_name}_center_x", f"{geom_name}_center_y", f"{geom_name}_center_z",
+        f"{geom_name}_surface_x", f"{geom_name}_surface_y", f"{geom_name}_surface_z",
+        f"{geom_name}_ground_x", f"{geom_name}_ground_y", f"{geom_name}_ground_z",
+        f"{geom_name}_root_rel_x", f"{geom_name}_root_rel_y", f"{geom_name}_root_rel_z",
+        f"{geom_name}_ground_root_rel_x", f"{geom_name}_ground_root_rel_y", f"{geom_name}_ground_root_rel_z",
+    ])
 for jn in joint_names:
-    telemetry_headers.extend([f"{jn}_pos_rad", f"{jn}_vel_rpm", f"{jn}_torque_nm"])
+    telemetry_headers.extend([f"{jn}_target_rad", f"{jn}_actual_rad", f"{jn}_vel_rpm", f"{jn}_torque_nm"])
 
 step_counter = 0
+trajectory_path = PROJECT_ROOT / "robot_trajectory.csv"
+trajectory_file = trajectory_path.open("w", newline="", buffering=1)
+trajectory_writer = csv.writer(trajectory_file)
+trajectory_writer.writerow(telemetry_headers)
+print(f"Recording live trajectory to {trajectory_path}")
 
 with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) as viewer:
     viewer.cam.lookat[:] = [0, 0, 0.8]
@@ -578,7 +631,7 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
         if walk_mode in ["turn_left", "turn_right"] and state == 2:
             min_dur = 0.30
 
-        # --- UPDATE KEYBOARD (every 10ms) ---
+        # --- UPDATE VIEWER COMMAND (every 10ms) ---
         if step_counter % 10 == 0:
             update_keys()
 
@@ -732,6 +785,7 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
             alpha = 3 * alpha**2 - 2 * alpha**3
 
         # --- PD CONTROL ---
+        target_joint_positions = {}
         for actuator_id, joint_name in enumerate(joint_names):
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
             qpos_addr = model.jnt_qposadr[jid]
@@ -748,6 +802,7 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
                 elif joint_name == "right_hip_yaw":
                     target_pos += right_bias
 
+            target_joint_positions[joint_name] = target_pos
             kp, kd = get_gains(joint_name)
             torque = kp * (target_pos - current_pos) - kd * current_vel
             gear = model.actuator_gear[actuator_id, 0]
@@ -767,11 +822,28 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
         if step_counter % 10 == 0:
             roll, pitch, yaw = get_imu_data()
             torso_id = get_body_id("torso")
+            com = data.subtree_com[torso_id]
             row = [
-                elapsed, state, walk_mode,
+                elapsed, state, walk_mode, motion_command, step_count,
+                data.qpos[0], data.qpos[1], data.qpos[2],
                 data.xpos[torso_id, 0], data.xpos[torso_id, 1], data.xpos[torso_id, 2],
+                com[0], com[1], com[2],
                 roll, pitch, yaw
             ]
+            for body_name in trajectory_body_names:
+                body_id = get_body_id(body_name)
+                row.extend(data.xpos[body_id].tolist())
+            for geom_name in foot_geom_names:
+                geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+                surface_point = get_foot_surface_point(geom_name)
+                ground_point = np.array([surface_point[0], surface_point[1], 0.0])
+                root_relative_surface = world_to_root_frame(surface_point)
+                root_relative_ground = world_to_root_frame(ground_point)
+                row.extend(data.geom_xpos[geom_id].tolist())
+                row.extend(surface_point.tolist())
+                row.extend(ground_point.tolist())
+                row.extend(root_relative_surface.tolist())
+                row.extend(root_relative_ground.tolist())
             for actuator_id, joint_name in enumerate(joint_names):
                 jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
                 pos = data.qpos[model.jnt_qposadr[jid]]
@@ -779,7 +851,7 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
                 rpm = vel * 60.0 / (2 * math.pi)
                 gear = model.actuator_gear[actuator_id, 0]
                 actual_torque = data.ctrl[actuator_id] * gear
-                row.extend([pos, rpm, actual_torque])
+                row.extend([target_joint_positions[joint_name], pos, rpm, actual_torque])
             
             # Determine fine-grained action for telemetry grouping
             current_action = "idle"
@@ -797,6 +869,10 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
                 current_action = "turn_right"
 
             telemetry_data[current_action].append(row)
+            trajectory_rows.append(row)
+            trajectory_writer.writerow(row)
+            if step_counter % 100 == 0:
+                trajectory_file.flush()
 
         step_counter += 1
 
@@ -804,13 +880,18 @@ with mujoco.viewer.launch_passive(model, data, key_callback=handle_viewer_key) a
         if remaining > 0:
             time.sleep(remaining)
 
-print("Simulation finished. Writing telemetry files...")
+trajectory_file.flush()
+trajectory_file.close()
+
+print("Simulation finished. Writing trajectory files...")
+if trajectory_rows:
+    print(f"Saved {len(trajectory_rows)} rows to {trajectory_path}.")
 for action, data_rows in telemetry_data.items():
     if not data_rows:
         continue
-    filename = f"telemetry_{action}.csv"
-    with open(filename, "w", newline="") as f:
+    path = PROJECT_ROOT / f"telemetry_{action}.csv"
+    with path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(telemetry_headers)
         writer.writerows(data_rows)
-    print(f"Saved {len(data_rows)} rows of telemetry data to {filename}.")
+    print(f"Saved {len(data_rows)} rows of telemetry data to {path}.")
